@@ -556,7 +556,7 @@ fn enumerate_mft(volume: Handle) -> Result<Vec<MftRecord>, String> {
             }
             return Err(format!(
                 "FSCTL_ENUM_USN_DATA failed: {}",
-                io::Error::from_raw_os_error(code)
+                io::Error::from_raw_os_error(code as i32)
             ));
         }
 
