@@ -15,7 +15,7 @@ permissions:
 
 jobs:
   build-windows-x64:
-    name: Build Windows x64 (MSVC)
+    name: Build and test Windows x64 (MSVC)
     runs-on: windows-latest
 
     steps:
@@ -25,10 +25,8 @@ jobs:
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable
         with:
+          targets: x86_64-pc-windows-msvc
           components: rustfmt
-
-      - name: Add Windows MSVC target
-        run: rustup target add x86_64-pc-windows-msvc
 
       - name: Generate dependency lockfile
         run: cargo generate-lockfile
