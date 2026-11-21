@@ -758,7 +758,7 @@ fn print_directory(
     println!("Total size:    {}", format_bytes(directory.total_bytes));
     println!("Direct files:  {}", format_bytes(directory.direct_bytes));
     println!("Files:         {} total | {} direct", format_number(u128::from(directory.total_files)), format_number(u128::from(directory.direct_files)));
-    println!("Directories:   {}", format_number(u128::from(total_children)));
+    println!("Directories:   {}", format_number(total_children as u128));
 
     println!("\nTOP DIRECT FILES");
     println!("{}", "-".repeat(110));
