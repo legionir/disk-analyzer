@@ -1,8 +1,8 @@
 [package]
 name = "disk-analyzer"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
-description = "Fast parallel disk usage analyzer for Windows"
+description = "Parallel Windows disk analyzer with native NTFS MFT support"
 license = "MIT"
 
 [[bin]]

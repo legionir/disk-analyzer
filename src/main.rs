@@ -8,6 +8,9 @@ use std::process;
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex};
 
+#[cfg(windows)]
+mod mft_windows;
+
 const TOP_FILES_PER_DIRECTORY: usize = 10;
 const MAX_ERROR_SAMPLES: usize = 50;
 const PROGRESS_INTERVAL: u64 = 50_000;
@@ -18,6 +21,7 @@ struct Config {
     excludes: Vec<PathBuf>,
     threads: usize,
     page_size: usize,
+    engine: String,
 }
 
 #[derive(Default)]
@@ -27,7 +31,6 @@ struct Counters {
     files: AtomicU64,
     skipped: AtomicU64,
     errors: AtomicU64,
-    excluded: AtomicU64,
 }
 
 struct SharedScan {
@@ -44,6 +47,8 @@ struct WorkerShard {
 #[derive(Default)]
 struct DirectoryStats {
     direct_bytes: u128,
+    direct_allocated_bytes: u128,
+    directory_allocated_bytes: u128,
     direct_files: u64,
     top_files: Vec<FileInfo>,
 }
@@ -52,6 +57,9 @@ struct DirectoryStats {
 struct FileInfo {
     path: PathBuf,
     size: u64,
+    allocated_size: u64,
+    file_id: Option<String>,
+    links: u32,
 }
 
 struct WorkerState {
@@ -68,6 +76,9 @@ struct DirectoryNode {
     children: Vec<usize>,
     direct_bytes: u128,
     total_bytes: u128,
+    direct_allocated_bytes: u128,
+    directory_allocated_bytes: u128,
+    total_allocated_bytes: u128,
     direct_files: u64,
     total_files: u64,
     top_files: Vec<FileInfo>,
@@ -84,16 +95,38 @@ struct ScanResult {
     errors: u64,
     excluded: u64,
     error_samples: Vec<String>,
+    engine: String,
+    allocated_available: bool,
+    hard_linked_files: u64,
 }
 
 impl DirectoryStats {
     fn add_file(&mut self, path: &Path, size: u64) {
+        self.add_file_with_metadata(path, size, 0, None, 1);
+    }
+
+    fn add_directory_allocation(&mut self, allocated_size: u64) {
+        self.directory_allocated_bytes += u128::from(allocated_size);
+    }
+
+    fn add_file_with_metadata(
+        &mut self,
+        path: &Path,
+        size: u64,
+        allocated_size: u64,
+        file_id: Option<String>,
+        links: u32,
+    ) {
         self.direct_bytes += u128::from(size);
+        self.direct_allocated_bytes += u128::from(allocated_size);
         self.direct_files += 1;
 
         let candidate = FileInfo {
             path: path.to_path_buf(),
             size,
+            allocated_size,
+            file_id,
+            links,
         };
 
         insert_top_file(&mut self.top_files, candidate);
@@ -101,6 +134,8 @@ impl DirectoryStats {
 
     fn merge(&mut self, other: DirectoryStats) {
         self.direct_bytes += other.direct_bytes;
+        self.direct_allocated_bytes += other.direct_allocated_bytes;
+        self.directory_allocated_bytes += other.directory_allocated_bytes;
         self.direct_files += other.direct_files;
 
         for file in other.top_files {
@@ -118,13 +153,21 @@ fn insert_top_file(files: &mut Vec<FileInfo>, candidate: FileInfo) {
     let Some((smallest_index, smallest)) = files
         .iter()
         .enumerate()
-        .min_by_key(|(_, file)| file.size)
+        .min_by_key(|(_, file)| file_sort_size(file))
     else {
         return;
     };
 
-    if candidate.size > smallest.size {
+    if file_sort_size(&candidate) > file_sort_size(smallest) {
         files[smallest_index] = candidate;
+    }
+}
+
+fn file_sort_size(file: &FileInfo) -> u64 {
+    if file.file_id.is_some() {
+        file.allocated_size
+    } else {
+        file.size
     }
 }
 
@@ -281,6 +324,7 @@ fn parse_args() -> Result<Option<Config>, String> {
         .unwrap_or(8)
         .clamp(4, 16);
     let mut page_size = 40usize;
+    let mut engine = "auto".to_string();
 
     let args: Vec<String> = env::args().skip(1).collect();
     let mut index = 0;
@@ -317,6 +361,14 @@ fn parse_args() -> Result<Option<Config>, String> {
             page_size = parse_usize(value, "limit", 10, 200)?;
         } else if let Some(value) = arg.strip_prefix("--limit=") {
             page_size = parse_usize(value, "limit", 10, 200)?;
+        } else if arg == "--engine" {
+            index += 1;
+            let value = args
+                .get(index)
+                .ok_or_else(|| "Missing value after --engine".to_string())?;
+            engine = parse_engine(value)?;
+        } else if let Some(value) = arg.strip_prefix("--engine=") {
+            engine = parse_engine(value)?;
         } else if arg.starts_with('-') {
             return Err(format!("Unknown option: {arg}"));
         } else if root.is_none() {
@@ -362,7 +414,15 @@ fn parse_args() -> Result<Option<Config>, String> {
         excludes: resolved_excludes,
         threads,
         page_size,
+        engine,
     }))
+}
+
+fn parse_engine(value: &str) -> Result<String, String> {
+    match value.to_ascii_lowercase().as_str() {
+        "auto" | "walk" | "mft" => Ok(value.to_ascii_lowercase()),
+        _ => Err(format!("Invalid engine '{value}'. Use auto, walk, or mft.")),
+    }
 }
 
 fn default_root() -> PathBuf {
@@ -394,11 +454,13 @@ fn print_help() {
            --exclude PATH   Exclude a directory or file (repeatable)\n\
            --threads N      Worker threads (1..64)\n\
            --limit N        Directories per page (10..200)\n\
+           --engine MODE    Scanner: auto, mft, or walk (default: auto)\n\
            -h, --help       Show this help\n\n\
          EXAMPLES:\n\
            disk-analyzer.exe C:\\                    \n\
            disk-analyzer.exe C:\\ --exclude C:\\Windows\n\
-           disk-analyzer.exe C:\\ --threads 12 --limit 60\n"
+           disk-analyzer.exe C:\\ --threads 12 --limit 60\n\
+           disk-analyzer.exe C:\\ --engine mft\n"
     );
 }
 
@@ -407,6 +469,7 @@ fn run(config: Config) -> Result<(), String> {
 
     println!("\n\nScan completed.");
     println!("Root:          {}", display_path(&config.root));
+    println!("Engine:        {}", result.engine);
     println!("Directories:   {}", format_number(u128::from(result.directories)));
     println!("Files:         {}", format_number(u128::from(result.files)));
     println!("Entries:       {}", format_number(u128::from(result.entries)));
@@ -417,6 +480,18 @@ fn run(config: Config) -> Result<(), String> {
         "Logical size:  {}",
         format_bytes(result.nodes[result.root_index].total_bytes)
     );
+    if result.allocated_available {
+        println!(
+            "Allocated:     {}",
+            format_bytes(result.nodes[result.root_index].total_allocated_bytes)
+        );
+        println!(
+            "Hard-linked:   {} files (unique File IDs counted once)",
+            format_number(u128::from(result.hard_linked_files))
+        );
+    } else {
+        println!("Allocated:     unavailable in filesystem-walk mode");
+    }
 
     if !result.error_samples.is_empty() {
         println!("\nSome scan errors (up to {MAX_ERROR_SAMPLES}):");
@@ -436,6 +511,39 @@ fn run(config: Config) -> Result<(), String> {
 }
 
 fn scan(config: &Config) -> Result<ScanResult, String> {
+    match config.engine.as_str() {
+        "walk" => scan_walk(config),
+        "mft" => {
+            #[cfg(windows)]
+            {
+                mft_windows::scan(config)
+            }
+            #[cfg(not(windows))]
+            {
+                Err("The NTFS MFT engine is available only on Windows.".to_string())
+            }
+        }
+        _ => {
+            #[cfg(windows)]
+            {
+                match mft_windows::scan(config) {
+                    Ok(result) => Ok(result),
+                    Err(error) => {
+                        eprintln!("NTFS MFT scanner unavailable: {error}");
+                        eprintln!("Falling back to the parallel filesystem walker.\n");
+                        scan_walk(config)
+                    }
+                }
+            }
+            #[cfg(not(windows))]
+            {
+                scan_walk(config)
+            }
+        }
+    }
+}
+
+fn scan_walk(config: &Config) -> Result<ScanResult, String> {
     let shared = Arc::new(SharedScan {
         shards: Mutex::new(Vec::new()),
         counters: Counters::default(),
@@ -540,6 +648,9 @@ fn scan(config: &Config) -> Result<ScanResult, String> {
         errors,
         excluded,
         error_samples,
+        engine: "Parallel directory walker".to_string(),
+        allocated_available: false,
+        hard_linked_files: 0,
     })
 }
 
@@ -569,6 +680,9 @@ fn build_directory_tree(
             children: Vec::new(),
             direct_bytes: stats.direct_bytes,
             total_bytes: stats.direct_bytes,
+            direct_allocated_bytes: stats.direct_allocated_bytes,
+            directory_allocated_bytes: stats.directory_allocated_bytes,
+            total_allocated_bytes: stats.direct_allocated_bytes + stats.directory_allocated_bytes,
             direct_files: stats.direct_files,
             total_files: stats.direct_files,
             top_files: stats.top_files,
@@ -604,9 +718,11 @@ fn build_directory_tree(
         };
 
         let child_bytes = nodes[index].total_bytes;
+        let child_allocated_bytes = nodes[index].total_allocated_bytes;
         let child_files = nodes[index].total_files;
 
         nodes[parent_index].total_bytes += child_bytes;
+        nodes[parent_index].total_allocated_bytes += child_allocated_bytes;
         nodes[parent_index].total_files += child_files;
     }
 
@@ -728,9 +844,17 @@ fn sorted_children(result: &ScanResult, directory_index: usize) -> Vec<usize> {
     let mut children = result.nodes[directory_index].children.clone();
 
     children.sort_unstable_by(|left, right| {
-        result.nodes[*right]
-            .total_bytes
-            .cmp(&result.nodes[*left].total_bytes)
+        let left_size = if result.allocated_available {
+            result.nodes[*left].total_allocated_bytes
+        } else {
+            result.nodes[*left].total_bytes
+        };
+        let right_size = if result.allocated_available {
+            result.nodes[*right].total_allocated_bytes
+        } else {
+            result.nodes[*right].total_bytes
+        };
+        right_size.cmp(&left_size)
             .then_with(|| result.nodes[*left].path.cmp(&result.nodes[*right].path))
     });
 
@@ -755,28 +879,53 @@ fn print_directory(
     println!("DISK ANALYZER");
     println!("{}", "=".repeat(110));
     println!("Path:          {}", display_path(&directory.path));
-    println!("Total size:    {}", format_bytes(directory.total_bytes));
+    println!("Logical size:  {}", format_bytes(directory.total_bytes));
     println!("Direct files:  {}", format_bytes(directory.direct_bytes));
+    if result.allocated_available {
+        println!("Allocated:     {}", format_bytes(directory.total_allocated_bytes));
+        println!("File alloc:     {}", format_bytes(directory.direct_allocated_bytes));
+        println!("Dir indexes:   {}", format_bytes(directory.directory_allocated_bytes));
+    }
     println!("Files:         {} total | {} direct", format_number(u128::from(directory.total_files)), format_number(u128::from(directory.direct_files)));
     println!("Directories:   {}", format_number(total_children as u128));
 
-    println!("\nTOP DIRECT FILES");
+    println!(
+        "\nTOP DIRECT FILES (sorted by {})",
+        if result.allocated_available { "allocated size" } else { "logical size" }
+    );
     println!("{}", "-".repeat(110));
 
     let mut top_files = directory.top_files.clone();
     top_files.sort_unstable_by(|left, right| {
-        right.size.cmp(&left.size).then_with(|| left.path.cmp(&right.path))
+        file_sort_size(right)
+            .cmp(&file_sort_size(left))
+            .then_with(|| left.path.cmp(&right.path))
     });
 
     if top_files.is_empty() {
         println!("No direct files.");
     } else {
         for file in top_files.iter().take(TOP_FILES_PER_DIRECTORY) {
-            println!("{:>12}  {}", format_bytes(u128::from(file.size)), display_path(&file.path));
+            if result.allocated_available {
+                let identity = file.file_id.as_deref().unwrap_or("-");
+                println!(
+                    "logical {:>10} | allocated {:>10} | links {:>3} | id {} | {}",
+                    format_bytes(u128::from(file.size)),
+                    format_bytes(u128::from(file.allocated_size)),
+                    file.links,
+                    identity,
+                    display_path(&file.path)
+                );
+            } else {
+                println!("{:>12}  {}", format_bytes(u128::from(file.size)), display_path(&file.path));
+            }
         }
     }
 
-    println!("\nSUBDIRECTORIES (sorted by total size)");
+    println!(
+        "\nSUBDIRECTORIES (sorted by {})",
+        if result.allocated_available { "allocated size" } else { "logical size" }
+    );
     println!("{}", "-".repeat(110));
     println!("{:<5} {:>12} {:>8}  {}", "#", "SIZE", "SHARE", "DIRECTORY");
     println!("{}", "-".repeat(110));
@@ -786,16 +935,21 @@ fn print_directory(
     } else {
         for (visible_index, child_index) in children[start..end].iter().enumerate() {
             let child = &result.nodes[*child_index];
-            let share = if directory.total_bytes == 0 {
+            let (child_size, parent_size) = if result.allocated_available {
+                (child.total_allocated_bytes, directory.total_allocated_bytes)
+            } else {
+                (child.total_bytes, directory.total_bytes)
+            };
+            let share = if parent_size == 0 {
                 0.0
             } else {
-                (child.total_bytes as f64 / directory.total_bytes as f64) * 100.0
+                (child_size as f64 / parent_size as f64) * 100.0
             };
 
             println!(
                 "{:<5} {:>12} {:>7.2}%  {}",
                 visible_index + 1,
-                format_bytes(child.total_bytes),
+                format_bytes(child_size),
                 share,
                 child.path.file_name().unwrap_or(child.path.as_os_str()).to_string_lossy()
             );
@@ -874,6 +1028,55 @@ mod tests {
     }
 
     #[test]
+    fn allocated_totals_include_directory_indexes_and_descendants() {
+        let root = PathBuf::from("root");
+        let child = root.join("child");
+
+        let mut root_stats = DirectoryStats::default();
+        root_stats.add_directory_allocation(4096);
+        root_stats.add_file_with_metadata(
+            &root.join("root.bin"),
+            100,
+            1024,
+            Some("01".to_string()),
+            1,
+        );
+
+        let mut child_stats = DirectoryStats::default();
+        child_stats.add_directory_allocation(2048);
+        child_stats.add_file_with_metadata(
+            &child.join("child.bin"),
+            200,
+            512,
+            Some("02".to_string()),
+            1,
+        );
+
+        let directory_stats = HashMap::from([
+            (root.clone(), root_stats),
+            (child.clone(), child_stats),
+        ]);
+        let config = Config {
+            root: root.clone(),
+            excludes: Vec::new(),
+            threads: 2,
+            page_size: 20,
+            engine: "mft".to_string(),
+        };
+
+        let (nodes, root_index) = build_directory_tree(&config, directory_stats).unwrap();
+        let root_node = &nodes[root_index];
+        let child_node = nodes
+            .iter()
+            .find(|node| node.path == child)
+            .unwrap();
+
+        assert_eq!(root_node.directory_allocated_bytes, 4096);
+        assert_eq!(child_node.directory_allocated_bytes, 2048);
+        assert_eq!(root_node.total_allocated_bytes, 4096 + 1024 + 2048 + 512);
+    }
+
+    #[test]
     fn top_file_list_keeps_largest_items() {
         let mut files = Vec::new();
         for size in 1..=(TOP_FILES_PER_DIRECTORY as u64 + 5) {
@@ -882,6 +1085,9 @@ mod tests {
                 FileInfo {
                     path: PathBuf::from(format!("file-{size}")),
                     size,
+                    allocated_size: size,
+                    file_id: None,
+                    links: 1,
                 },
             );
         }
